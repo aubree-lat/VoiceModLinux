@@ -15,7 +15,7 @@
 set -eu
 
 REPO=aubree-lat/VoiceModLinux
-REF=${VMLINUX_REF:-v0.1.0}                         # a release tag; bump it when you publish a new one
+REF=${VMLINUX_REF:-v0.2.0}                         # a release tag; bump it when you publish a new one
 DEST=${VMLINUX_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/voicemod-linux}
 URL=${VMLINUX_TARBALL:-https://github.com/$REPO/archive/$REF.tar.gz}
 

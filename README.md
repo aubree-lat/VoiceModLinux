@@ -5,7 +5,8 @@ virtual microphone called **Voicemod** that Discord, games, OBS and anything els
 
 > **Unofficial.** Not made, endorsed or supported by Voicemod S.L. You need your own Voicemod
 > account (free works; Pro features need Pro, exactly as on Windows). This project contains **no
-> Voicemod files**: you download Voicemod's own installer yourself and it runs as-is. Read
+> Voicemod files**: the installer downloads Voicemod straight from Voicemod's own servers and it
+> runs as-is. Read
 > [the honest warnings](#honest-warnings) before you start.
 
 ---
@@ -48,10 +49,13 @@ bash install.sh
 It explains each step in plain words. It will:
 
 - ask your password once, to install a few programs from Fedora's own software sources;
-- ask you to download **Voicemod's installer** from [voicemod.net](https://www.voicemod.net/)
-  (it opens the page for you; sign in and download the Windows installer);
-- install Voicemod (about 400 MB, several minutes: a few small windows may flash, that's normal);
+- download **Voicemod** from Voicemod's own servers, and Microsoft's Visual C++ runtime (which
+  Voicemod needs) from Microsoft: about 450 MB in total, a few minutes, and a few small windows
+  may flash, which is normal. You need about 3 GB of free disk space;
 - optionally let your account read the keyboard so **hotkeys** work (it asks first).
+
+If the automatic download ever fails, it falls back to asking you for Voicemod's own installer
+(it opens [voicemod.net](https://www.voicemod.net/) for you).
 
 ### 4. Start Voicemod
 Press **Super**, type `Voicemod`, press Enter. The first start takes about a minute.

@@ -134,33 +134,32 @@ else
     ok "downloaded"
 fi
 
-# ---------------------------------------------------------------- Voicemod's own installer
-say "Finding your Voicemod installer"
-find_installer() {
-    local d f
-    for d in "$HERE/installer" "$HOME/Downloads" "$HOME/Desktop" "$HOME"; do
-        [ -d "$d" ] || continue
-        f=$(ls -t "$d"/VoicemodInstaller*.exe 2>/dev/null | head -1)
-        [ -n "$f" ] && { echo "$f"; return; }
-    done
-}
-INSTALLER=$(find_installer)
-if [ -z "$INSTALLER" ]; then
-    note "I couldn't find the Voicemod installer (a file called VoicemodInstaller_....exe)."
-    note "You download it yourself from Voicemod, so it stays your own copy:"
+# ---------------------------------------------------------------- Voicemod itself
+say "Installing Voicemod"
+note "This downloads Voicemod's app from Voicemod's own servers and Microsoft's Visual C++"
+note "runtime from Microsoft (about 450 MB in total) and takes several minutes. A few small"
+note "windows may flash. That's normal. Please wait."
+if ! "$HERE/vmwine" install; then
+    say "The automatic download didn't work"
+    note "No problem: you can use Voicemod's own installer instead. You download it yourself:"
     note "  1. Open https://www.voicemod.net/ and sign in (or make a free account)"
     note "  2. Download the Windows installer. Your browser saves it to Downloads."
+    find_installer() {
+        local d f
+        for d in "$HERE/installer" "$HOME/Downloads" "$HOME/Desktop" "$HOME"; do
+            [ -d "$d" ] || continue
+            f=$(ls -t "$d"/VoicemodInstaller*.exe 2>/dev/null | head -1)
+            [ -n "$f" ] && { echo "$f"; return; }
+        done
+    }
+    [ "$ASSUME_YES" = 1 ] && die "the automatic install failed (see the messages above)."
     command -v xdg-open >/dev/null && xdg-open "https://www.voicemod.net/" >/dev/null 2>&1 &
-    if [ "$ASSUME_YES" = 1 ]; then die "no installer found."; fi
     read -r -p "   Press Enter when the download has finished... " _
     INSTALLER=$(find_installer)
-    [ -n "$INSTALLER" ] || die "still no VoicemodInstaller*.exe in Downloads. Download it, then run ./install.sh again."
+    [ -n "$INSTALLER" ] || die "no VoicemodInstaller*.exe found in Downloads. Download it, then run ./install.sh again."
+    ok "$INSTALLER"
+    "$HERE/vmwine" install "$INSTALLER" || die "the Voicemod install failed. See the messages above."
 fi
-ok "$INSTALLER"
-
-say "Installing Voicemod (this downloads about 400 MB and takes several minutes)"
-note "Windows may flash a few small windows. That's normal. Please wait."
-"$HERE/vmwine" install "$INSTALLER" || die "the Voicemod install failed. See the messages above."
 
 # ---------------------------------------------------------------- convenience + hotkeys
 say "Finishing up"

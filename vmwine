@@ -2,7 +2,8 @@
 # vmwine - Voicemod for Linux (unofficial): run Voicemod V3 with Wine.
 # https://github.com/GladCubes/voicemod-for-linux
 #
-#   vmwine install <VoicemodInstaller.exe>   create the Wine prefix and install everything
+#   vmwine install                           create the Wine prefix and install Voicemod (downloads it)
+#   vmwine install <VoicemodInstaller.exe>   same, using Voicemod's own installer instead
 #   vmwine [ui]                              start the engine and open the Voicemod window (default)
 #   vmwine start-engine                      start only the (hidden) engine and the virtual devices
 #   vmwine stop                              stop the engine and remove the virtual devices
@@ -49,7 +50,12 @@ ask() {   # ask title text ok-label cancel-label
 appdata()  { ls -d "$WINEPREFIX"/drive_c/users/*/AppData/Local/VoicemodV3 2>/dev/null | head -1; }
 vmlog()    { echo "$(appdata)/logs/voicemod-desktop.log"; }
 last_session() { awk '/Voicemod app started/{buf=""} {buf=buf"\n"$0} END{print buf}' "$(vmlog)" 2>/dev/null; }
-installed_version() { grep -ao "Core Version: [0-9.]*" "$(vmlog)" 2>/dev/null | tail -1 | awk '{print $3}'; }
+installed_version() {
+    local v
+    v=$(grep -ao "Core Version: [0-9.]*" "$(vmlog)" 2>/dev/null | tail -1 | awk '{print $3}')
+    [ -n "$v" ] || v=$(cat "$STATE/app-version" 2>/dev/null)
+    echo "$v"
+}
 version_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
 latest_version() {   # what the app itself would be offered: the path is the current version
     curl -4 -s -m 6 "https://api.voicemod.net/v1/nextgen/update/${1:-0.0.0}" |
@@ -84,11 +90,19 @@ remove_audio_devices() {
 }
 
 # ---------------------------------------------------------------------------
+# `vmwine install`              download Voicemod's app and Microsoft's Visual C++ runtime ourselves
+# `vmwine install <installer>`  fallback: use Voicemod's own installer (a file you downloaded)
 cmd_install() {
     local installer=${1:-}
-    [ -n "$installer" ] && [ -f "$installer" ] || die "usage: vmwine install <VoicemodInstaller.exe>
-Download the installer from https://www.voicemod.net (it requires logging in)."
-    need wine wineserver pactl pw-link curl python3 rsync
+    [ -z "$installer" ] || [ -f "$installer" ] || die "no such file: $installer"
+    install_preflight
+    install_make_prefix
+    if [ -n "$installer" ]; then install_with_installer "$installer"; else install_direct; fi
+    install_finish
+}
+
+install_preflight() {
+    need wine wineserver pactl pw-link curl python3 rsync unzip
     for f in vmvad.sys vmhook.dll vmlaunch.exe; do
         [ -f "$BIN/$f" ] || die "$BIN/$f not found: run 'make' first (needs mingw-w64)"
     done
@@ -98,12 +112,11 @@ Download the installer from https://www.voicemod.net (it requires logging in)."
     pgrep -f 'VoicemodV3.app.last.Voicemod.exe|Voicemod V3.Voicemod.exe' >/dev/null &&
         die "close Voicemod first (every running instance, in any Wine prefix)"
 
-    # Broken IPv6 (a default route but no connectivity) makes every connection of
-    # the installer wait for a ~3 minute timeout.
-    # (Tested against a dual-stack host: Voicemod's own servers are IPv4-only, so
-    # probing them over IPv6 always "fails" and gave a false warning.)
+    # Broken IPv6 (a default route but no connectivity) makes every connection wait for a
+    # ~3 minute timeout. (Tested against a dual-stack host: Voicemod's own servers are
+    # IPv4-only, so probing them over IPv6 always "fails" and gave a false warning.)
     if [ -n "$(ip -6 route show default 2>/dev/null)" ] && ! curl -6 -s -o /dev/null -m 5 https://www.google.com; then
-        say "warning: your IPv6 seems broken; the installer may take very long."
+        say "warning: your IPv6 seems broken; downloads may take very long."
         say "         temporary fix (until reboot): sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1"
     fi
 
@@ -114,16 +127,20 @@ Download the installer from https://www.voicemod.net (it requires logging in)."
     local ovr="mscoree,mshtml=d"
     [ "${VMWINE_NO_MENUS:-0}" = 1 ] && ovr="$ovr;winemenubuilder.exe=d"
     export WINEDLLOVERRIDES=$ovr
+}
 
+install_make_prefix() {
     say "creating the Wine prefix in $WINEPREFIX"
     mkdir -p "$WINEPREFIX"
     wineboot -u >/dev/null 2>&1 || die "wineboot failed"
     wine winecfg -v win10 >/dev/null 2>&1
+}
 
-    say "installing Voicemod (this downloads ~150 MB)"
-    wine "$installer" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- >"$WINELOG" 2>&1
-    # The installer only puts Voicemod's launcher in Program Files; the launcher
-    # downloads the actual app into AppData\Local\VoicemodV3\app\last and starts it.
+# Fallback: Voicemod's own installer. It only puts Voicemod's launcher in Program Files;
+# the launcher downloads the actual app into AppData\Local\VoicemodV3\app\last.
+install_with_installer() {
+    say "installing Voicemod with its own installer (this downloads ~150 MB)"
+    wine "$1" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- >"$WINELOG" 2>&1
     say "downloading the Voicemod app (~300 MB, a few minutes)"
     wine 'C:\Program Files\Voicemod V3\Voicemod.exe' >>"$WINELOG" 2>&1 &
     local t
@@ -135,7 +152,61 @@ Download the installer from https://www.voicemod.net (it requires logging in)."
     wineserver -k 2>/dev/null
     [ -n "$(appdata)" ] && [ -f "$(appdata)/app/last/Voicemod.exe" ] ||
         die "Voicemod was not installed (see $WINELOG and $(appdata)/logs/launcher.log)"
+}
 
+# Default: do what Voicemod's installer does, without the installer. It (1) installs
+# Microsoft's Visual C++ runtime, which Voicemod does not bundle, and (2) the launcher then
+# fetches the app zip from Voicemod's public update server, which we do directly.
+VC_REDIST_URL=https://aka.ms/vs/17/release/vc_redist.x64.exe
+
+install_direct() {
+    local cache=$DATA/cache redist info ver url zip app code
+    mkdir -p "$cache"
+
+    say "installing Microsoft's Visual C++ runtime (about 18 MB)"
+    redist=$cache/vc_redist.x64.exe
+    if [ ! -s "$redist" ]; then
+        curl -fSL --proto '=https' --proto-redir '=https' --progress-bar -o "$redist.part" "$VC_REDIST_URL" &&
+            mv "$redist.part" "$redist" || die "could not download the Visual C++ runtime from Microsoft"
+    fi
+    [ "$(head -c2 "$redist")" = MZ ] || { rm -f "$redist"; die "the Visual C++ runtime download is not a Windows program"; }
+    timeout 600 wine "$redist" /install /quiet /norestart >"$WINELOG" 2>&1
+    code=$?
+    wineserver -w 2>/dev/null
+    # 0 = ok, 3010 = ok (reboot wanted: meaningless under Wine)
+    if [ $code -ne 0 ] && [ $code -ne 3010 ]; then
+        say "warning: the runtime installer returned $code (checking the result instead)"
+    fi
+    wine reg query 'HKLM\Software\Classes\Installer\Dependencies\Microsoft.VS.VC_RuntimeMinimumVSU_amd64,v14' >/dev/null 2>&1 ||
+        die "the Visual C++ runtime did not install (see $WINELOG)"
+
+    say "finding the current Voicemod version"
+    info=$(curl -fsS -m 30 -H 'app-name: flagship-launcher' -H 'app-os: Windows' \
+        https://api.voicemod.net/v1/nextgen/update/0.0.0) || die "could not reach Voicemod's update server (api.voicemod.net)"
+    ver=$(python3 -I -c 'import json,sys; print(json.load(sys.stdin)["appVersion"])' <<<"$info") || die "unexpected answer from Voicemod's update server"
+    url=$(python3 -I -c 'import json,sys; print(json.load(sys.stdin)["version"]["update"]["windows"]["file"])' <<<"$info") || die "unexpected answer from Voicemod's update server"
+    case $url in https://flagship-versions.voicemod.net/*) ;; *) die "unexpected download address from Voicemod: $url" ;; esac
+    [[ $ver =~ ^[0-9]+(\.[0-9]+)*$ ]] || die "unexpected version from Voicemod: $ver"
+
+    zip=$cache/Voicemod_${ver}-Windows_Update.zip
+    if [ ! -s "$zip" ]; then
+        say "downloading Voicemod $ver (about 240 MB)"
+        curl -fSL --proto '=https' --progress-bar -o "$zip.part" "$url" && mv "$zip.part" "$zip" ||
+            die "the Voicemod download failed"
+    fi
+    unzip -tq "$zip" >/dev/null 2>&1 || { rm -f "$zip"; die "the Voicemod download is damaged; run the install again"; }
+
+    say "unpacking Voicemod $ver"
+    app=$WINEPREFIX/drive_c/users/${USER:-$(id -un)}/AppData/Local/VoicemodV3/app
+    mkdir -p "$app"
+    rm -rf "$app/last"
+    unzip -q "$zip" -d "$app/last" || die "could not unpack Voicemod"
+    [ -f "$app/last/Voicemod.exe" ] || die "Voicemod.exe is missing from the download"
+    mkdir -p "$STATE"
+    echo "$ver" >"$STATE/app-version"
+}
+
+install_finish() {
     say "installing the vmwine helpers"
     cp "$BIN/vmvad.sys" "$WINEPREFIX/drive_c/windows/system32/drivers/voicemodvad.sys"
     cp "$BIN/vmhook.dll" "$BIN/vmlaunch.exe" "$WINEPREFIX/drive_c/windows/system32/"
