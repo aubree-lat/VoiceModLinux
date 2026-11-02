@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Control the running Voicemod Linux app, e.g. from compositor key binds.
+
+  voicemod-ctl wheel show       open the Action Wheel (bind to key press)
+  voicemod-ctl wheel release    run the highlighted action and close (bind to key release)
+  voicemod-ctl wheel toggle     open, or run + close if already open
+  voicemod-ctl show             bring the Voicemod window to the front
+
+  voicemod-ctl voice NAME       switch voice (name match: exact, start, then contains)
+  voicemod-ctl voice random     random voice
+  voicemod-ctl voice list       list voices you can use
+  voicemod-ctl sound NAME       play a soundboard sound into the virtual mic
+  voicemod-ctl sound stop       stop all sounds
+  voicemod-ctl sound list       list sounds you can use
+  voicemod-ctl voice-changer on|off|toggle
+  voicemod-ctl hear-myself on|off|toggle
+  voicemod-ctl mute on|off|toggle
+
+  voicemod-ctl music on|off|toggle [APP]   also send an app's sound (default: spotify)
+                                           out through the Voicemod mic
+  voicemod-ctl music status                apps currently routed
+"""
+import os
+import socket
+import sys
+import tempfile
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir()
+SOCKET = os.path.join(RUNTIME, "voicemod-linux.sock")
+# Read by tools/vad-watch.py, which keeps these apps linked into the Voicemod sink.
+MUSIC_FILE = os.path.join(RUNTIME, "voicemod-linux-music")
+
+
+def music(args):
+    action = args[0] if args else "status"
+    app = (" ".join(args[1:]) or "spotify").strip().lower()
+    try:
+        with open(MUSIC_FILE, encoding="utf-8") as f:
+            apps = [line.strip() for line in f if line.strip()]
+    except FileNotFoundError:
+        apps = []
+    if action == "status":
+        print("\n".join(apps) if apps else "no apps routed to the Voicemod mic")
+        return 0
+    if action == "toggle":
+        action = "off" if app in apps else "on"
+    if action == "on" and app not in apps:
+        apps.append(app)
+    elif action == "off":
+        apps = [a for a in apps if a != app]
+    elif action != "on":
+        print("usage: voicemod-ctl music on|off|toggle [APP] | status", file=sys.stderr)
+        return 1
+    with open(MUSIC_FILE, "w", encoding="utf-8") as f:
+        f.write("".join(a + "\n" for a in apps))
+    print(f"music {app} {action}")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if args[0] == "music":
+        return music(args[1:])
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(5)
+            conn.connect(SOCKET)
+            conn.sendall((" ".join(args) + "\n").encode())
+            reply = b""
+            while chunk := conn.recv(4096):
+                reply += chunk
+    except OSError:
+        print("voicemod-ctl: Voicemod Linux is not running", file=sys.stderr)
+        return 1
+    text = reply.decode().strip()
+    if text != "ok":
+        print(text, file=sys.stderr if text.startswith("error") else sys.stdout)
+    return 1 if text.startswith("error") else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

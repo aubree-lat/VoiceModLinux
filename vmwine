@@ -1,0 +1,545 @@
+#!/bin/bash
+# vmwine - Voicemod for Linux (unofficial): run Voicemod V3 with Wine.
+# https://github.com/GladCubes/voicemod-for-linux
+#
+#   vmwine install <VoicemodInstaller.exe>   create the Wine prefix and install everything
+#   vmwine [ui]                              start the engine and open the Voicemod window (default)
+#   vmwine start-engine                      start only the (hidden) engine and the virtual devices
+#   vmwine stop                              stop the engine and remove the virtual devices
+#   vmwine url voicemod://...                hand a login link to the running engine
+#   vmwine ctl voice NAME | mute toggle ...  control the running app (bind these in your compositor)
+#   vmwine hotkeys [init|check]              global hotkeys: write/inspect ~/.config/vmwine/hotkeys.conf
+#   vmwine menu                              (re)install the app-menu entry and the voicemod:// handler
+#   vmwine run                               old mode: Voicemod's own window under Wine (crashes
+#                                            on current Voicemod builds, kept for debugging)
+#   vmwine rollback                          restore the last working Voicemod version
+#   vmwine status                            show what is installed and the last start
+#   vmwine uninstall                         remove the prefix, desktop entries and devices
+#
+# The Windows engine runs under Wine; the window is Voicemod's own web interface, extracted
+# from your copy of Voicemod.exe and shown by Electron (design after AriCuteGirl/voicemod-linux).
+# Not affiliated with Voicemod S.L. You need your own copy of Voicemod.
+set -u
+
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+BIN=${VMWINE_BIN:-$HERE/build}
+export WINEPREFIX=${VMWINE_PREFIX:-${XDG_DATA_HOME:-$HOME/.local/share}/vmwine/prefix}
+export WINEARCH=win64
+export WINEDEBUG=${WINEDEBUG:--all}
+STATE=$WINEPREFIX/vmwine
+BACKUPS=$STATE/backups
+DATA=${VMWINE_DATA:-$(dirname "$WINEPREFIX")/data}   # extracted frontend + version stamp
+HOOKLOG=/tmp/vmwine-hook.log
+WINELOG=${VMWINE_LOG:-/tmp/vmwine-wine.log}
+BLOCK_DEFAULT=flagship-versions.voicemod.net   # host serving the update zips
+
+die()    { echo "vmwine: $*" >&2; exit 1; }
+say()    { echo ":: $*"; }
+notify() { command -v notify-send >/dev/null && notify-send -a vmwine "$1" "$2"; echo "$1: $2"; }
+ask() {   # ask title text ok-label cancel-label
+    if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v zenity >/dev/null; then
+        zenity --question --title="$1" --text="$2" --ok-label="$3" --cancel-label="$4" --width=460 2>/dev/null
+    elif [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ] && command -v kdialog >/dev/null; then
+        kdialog --title "$1" --yes-label "$3" --no-label "$4" --yesno "$2" 2>/dev/null
+    else
+        local r; read -r -p "$2 [y/N] " r; [[ $r == [yY]* ]]
+    fi
+}
+
+appdata()  { ls -d "$WINEPREFIX"/drive_c/users/*/AppData/Local/VoicemodV3 2>/dev/null | head -1; }
+vmlog()    { echo "$(appdata)/logs/voicemod-desktop.log"; }
+last_session() { awk '/Voicemod app started/{buf=""} {buf=buf"\n"$0} END{print buf}' "$(vmlog)" 2>/dev/null; }
+installed_version() { grep -ao "Core Version: [0-9.]*" "$(vmlog)" 2>/dev/null | tail -1 | awk '{print $3}'; }
+version_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
+latest_version() {   # what the app itself would be offered: the path is the current version
+    curl -4 -s -m 6 "https://api.voicemod.net/v1/nextgen/update/${1:-0.0.0}" |
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["appVersion"])' 2>/dev/null
+}
+
+need() { for c in "$@"; do command -v "$c" >/dev/null || die "missing '$c'"; done; }
+
+# ---------------------------------------------------------------------------
+# PipeWire devices: "Voicemod" output (what Voicemod writes to) and a "Voicemod"
+# microphone fed by it. The mic is a null sink with media.class
+# Audio/Source/Virtual: module-remap-source nodes are device.class=filter and
+# Discord hides them.
+audio_devices() {
+    if ! pactl list short sinks | grep -q '\bvoicemod_out\b'; then
+        pactl load-module module-null-sink sink_name=voicemod_out media.class=Audio/Sink \
+            sink_properties="device.description=Voicemod" channel_map=stereo rate=48000 >/dev/null
+    fi
+    if ! pactl list short sources | grep -q '\bvoicemod_mic\b'; then
+        pactl load-module module-null-sink sink_name=voicemod_mic media.class=Audio/Source/Virtual \
+            channel_map=front-left,front-right sink_properties="device.description=Voicemod" >/dev/null
+        sleep 1
+    fi
+    pw-link voicemod_out:monitor_FL voicemod_mic:input_FL 2>/dev/null
+    pw-link voicemod_out:monitor_FR voicemod_mic:input_FR 2>/dev/null
+    return 0
+}
+
+remove_audio_devices() {
+    pactl list short modules | awk '/module-null-sink/ && /voicemod_(out|mic)/ {print $1}' |
+        while read -r m; do pactl unload-module "$m"; done
+}
+
+# ---------------------------------------------------------------------------
+cmd_install() {
+    local installer=${1:-}
+    [ -n "$installer" ] && [ -f "$installer" ] || die "usage: vmwine install <VoicemodInstaller.exe>
+Download the installer from https://www.voicemod.net (it requires logging in)."
+    need wine wineserver pactl pw-link curl python3 rsync
+    for f in vmvad.sys vmhook.dll vmlaunch.exe; do
+        [ -f "$BIN/$f" ] || die "$BIN/$f not found: run 'make' first (needs mingw-w64)"
+    done
+
+    # Voicemod's launcher refuses to download the app if any Voicemod instance is
+    # running (it checks a localhost socket shared by all Wine prefixes)
+    pgrep -f 'VoicemodV3.app.last.Voicemod.exe|Voicemod V3.Voicemod.exe' >/dev/null &&
+        die "close Voicemod first (every running instance, in any Wine prefix)"
+
+    # Broken IPv6 (a default route but no connectivity) makes every connection of
+    # the installer wait for a ~3 minute timeout.
+    # (Tested against a dual-stack host: Voicemod's own servers are IPv4-only, so
+    # probing them over IPv6 always "fails" and gave a false warning.)
+    if [ -n "$(ip -6 route show default 2>/dev/null)" ] && ! curl -6 -s -o /dev/null -m 5 https://www.google.com; then
+        say "warning: your IPv6 seems broken; the installer may take very long."
+        say "         temporary fix (until reboot): sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1"
+    fi
+
+    # VMWINE_NO_MENUS=1: Wine creates no menu/desktop/protocol entries at all
+    # (for testing next to another install; the voicemod:// login handler is lost)
+    # Voicemod is a Qt app: it needs neither Wine Mono nor Gecko, and their
+    # download prompts would block a scripted install.
+    local ovr="mscoree,mshtml=d"
+    [ "${VMWINE_NO_MENUS:-0}" = 1 ] && ovr="$ovr;winemenubuilder.exe=d"
+    export WINEDLLOVERRIDES=$ovr
+
+    say "creating the Wine prefix in $WINEPREFIX"
+    mkdir -p "$WINEPREFIX"
+    wineboot -u >/dev/null 2>&1 || die "wineboot failed"
+    wine winecfg -v win10 >/dev/null 2>&1
+
+    say "installing Voicemod (this downloads ~150 MB)"
+    wine "$installer" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- >"$WINELOG" 2>&1
+    # The installer only puts Voicemod's launcher in Program Files; the launcher
+    # downloads the actual app into AppData\Local\VoicemodV3\app\last and starts it.
+    say "downloading the Voicemod app (~300 MB, a few minutes)"
+    wine 'C:\Program Files\Voicemod V3\Voicemod.exe' >>"$WINELOG" 2>&1 &
+    local t
+    for t in $(seq 1 300); do
+        pgrep -f 'app.last.Voicemod.exe' >/dev/null && break
+        sleep 3
+    done
+    sleep 5
+    wineserver -k 2>/dev/null
+    [ -n "$(appdata)" ] && [ -f "$(appdata)/app/last/Voicemod.exe" ] ||
+        die "Voicemod was not installed (see $WINELOG and $(appdata)/logs/launcher.log)"
+
+    say "installing the vmwine helpers"
+    cp "$BIN/vmvad.sys" "$WINEPREFIX/drive_c/windows/system32/drivers/voicemodvad.sys"
+    cp "$BIN/vmhook.dll" "$BIN/vmlaunch.exe" "$WINEPREFIX/drive_c/windows/system32/"
+    wine sc create voicemodvad type= kernel start= demand \
+        binPath= 'C:\windows\system32\drivers\voicemodvad.sys' >/dev/null 2>&1
+    wineserver -k 2>/dev/null
+
+    remove_wine_shortcuts
+    [ "${VMWINE_NO_MENUS:-0}" = 1 ] || desktop_entry
+    mkdir -p "$BACKUPS"
+    apply_registry
+    extract_frontend || die "could not extract the Voicemod interface"
+    say "done. Start Voicemod with:  $0"
+    say "in Discord / games pick the microphone called \"Voicemod\"."
+}
+
+# Voicemod's UI (QtWebEngine/ANGLE) shares D3D11 textures, which wined3d does
+# not implement ("Failed to share D3D11 texture": black window). DXVK does.
+install_dxvk() {
+    local tmp url
+    say "installing DXVK (needs a Vulkan driver)"
+    tmp=$(mktemp -d)
+    url=$(curl -s -m 20 https://api.github.com/repos/doitsujin/dxvk/releases/latest |
+          python3 -c 'import json,sys; print(next(a["browser_download_url"] for a in json.load(sys.stdin)["assets"] if a["name"].endswith(".tar.gz") and "native" not in a["name"]))' 2>/dev/null)
+    [ -n "$url" ] || die "cannot find the DXVK release on GitHub"
+    curl -sL -m 120 "$url" | tar xz -C "$tmp" || die "DXVK download failed"
+    local d; d=$(ls -d "$tmp"/dxvk-*)
+    for dll in d3d11 dxgi d3d10core; do
+        cp "$d/x64/$dll.dll" "$WINEPREFIX/drive_c/windows/system32/"
+        cp "$d/x32/$dll.dll" "$WINEPREFIX/drive_c/windows/syswow64/"
+        wine reg add 'HKCU\Software\Wine\DllOverrides' /v "$dll" /d native /f >/dev/null 2>&1
+    done
+    say "DXVK $(basename "$d" | sed 's/dxvk-//') installed"
+    rm -rf "$tmp"
+}
+
+# Wine turns the installer's shortcuts into desktop/menu entries that start
+# Voicemod's own launcher without vmhook (black window, no updates control):
+# remove the ones pointing into our prefix. The voicemod:// protocol handler is
+# kept, the login in the browser redirects to it.
+remove_wine_shortcuts() {
+    local f
+    grep -rlsF "WINEPREFIX=$WINEPREFIX" \
+        "${XDG_DATA_HOME:-$HOME/.local/share}/applications/wine" \
+        "$(xdg-user-dir DESKTOP 2>/dev/null || echo "$HOME/Desktop")" 2>/dev/null |
+        while read -r f; do
+            grep -qiE '^Exec=.*(Voicemod V3\.lnk|Programs\\\\+Voicemod)' "$f" && rm -f "$f"
+        done
+    rmdir "${XDG_DATA_HOME:-$HOME/.local/share}/applications/wine/Programs/Voicemod V3" 2>/dev/null
+    return 0
+}
+
+desktop_entry() {
+    local apps=${XDG_DATA_HOME:-$HOME/.local/share}/applications icon=audio-input-microphone
+    local ico="$WINEPREFIX/drive_c/Program Files/Voicemod V3/voicemod.ico"
+    mkdir -p "$apps"
+    if [ -f "$ico" ] && command -v magick >/dev/null; then
+        mkdir -p "$STATE"
+        magick "$ico[0]" "$STATE/icon.png" 2>/dev/null && icon=$STATE/icon.png
+    fi
+    cat >"$apps/vmwine.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Voicemod (Linux)
+Comment=Voicemod running under Wine
+Exec="$HERE/vmwine" ui
+Icon=$icon
+Terminal=false
+Categories=AudioVideo;Audio;
+EOF
+    # Sign-in happens in the browser and comes back as a voicemod:// link.
+    cat >"$apps/vmwine-url.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Voicemod (link handler)
+Exec="$HERE/vmwine" url %u
+MimeType=x-scheme-handler/voicemod;
+NoDisplay=true
+EOF
+    xdg-mime default vmwine-url.desktop x-scheme-handler/voicemod 2>/dev/null
+    update-desktop-database "$apps" 2>/dev/null
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# A newer vmwine release (git pull + make, or a new prebuilt tarball) only has to be
+# started once: the helpers in the prefix are replaced, Voicemod and its login are kept.
+sync_helpers() {
+    local f dst n=0
+    for f in vmhook.dll vmlaunch.exe vmvad.sys; do
+        [ -f "$BIN/$f" ] || continue
+        case $f in
+            vmvad.sys) dst=$WINEPREFIX/drive_c/windows/system32/drivers/voicemodvad.sys ;;
+            *)         dst=$WINEPREFIX/drive_c/windows/system32/$f ;;
+        esac
+        cmp -s "$BIN/$f" "$dst" && continue
+        cp "$BIN/$f" "$dst" && n=$((n+1))
+    done
+    if [ "$n" -gt 0 ]; then
+        say "updated $n vmwine helper(s) in the prefix"
+        desktop_entry   # the menu entry now starts this copy of vmwine
+    fi
+    return 0
+}
+
+cmd_run() {
+    need wine wineserver pactl pw-link
+    [ -n "$(appdata)" ] || die "Voicemod is not installed: run 'vmwine install <installer>'"
+    local app cur latest approved=0 before ok=0 now good session
+    app=$(appdata)/app/last
+    mkdir -p "$BACKUPS"
+    sync_helpers
+
+    # Voicemod would update itself on start; the zip download is blocked unless
+    # the user approves the update here.
+    export VMWINE_BLOCK_HOSTS=${VMWINE_BLOCK_HOSTS-$BLOCK_DEFAULT}
+    cur=$(installed_version)
+    latest=$(latest_version "$cur")
+    if [ -n "$cur" ] && [ -n "$latest" ] && version_gt "$latest" "$cur" &&
+       [ "$(cat "$STATE/skipped" 2>/dev/null)" != "$latest" ]; then
+        if ask "Voicemod update" "Voicemod $latest is available (you have $cur).
+
+WARNING: on Linux Voicemod works thanks to a stub driver and in-memory patches.
+An update may break it (black window, driver popup, no audio).
+
+Your current version is backed up first: if something goes wrong, go back with
+  vmwine rollback" "Update" "Not now"; then
+            [ -d "$BACKUPS/$cur" ] || cp -a "$app" "$BACKUPS/$cur"
+            ls -1t "$BACKUPS" | tail -n +3 | while read -r old; do rm -rf "${BACKUPS:?}/$old"; done
+            export VMWINE_BLOCK_HOSTS=""
+            approved=1
+        else
+            echo "$latest" >"$STATE/skipped"
+        fi
+    fi
+
+    audio_devices
+
+    # Voicemod overrides QTWEBENGINE_CHROMIUM_FLAGS but honours this one; without
+    # it Chromium's sandbox blocks the renderer under Wine (black window).
+    export QTWEBENGINE_DISABLE_SANDBOX=1
+    export QT_QUICK_BACKEND=software QT_OPENGL=software
+
+    before=$(grep -c "Voicemod app started" "$(vmlog)" 2>/dev/null || echo 0)
+    rm -f "$HOOKLOG"
+    wineserver -k 2>/dev/null
+    sleep 1
+    wineserver -p >/dev/null 2>&1 </dev/null   # keep the prefix alive: the driver dies with the last process
+    wine sc start voicemodvad >/dev/null 2>&1
+    wine 'C:\windows\system32\vmlaunch.exe' >"$WINELOG" 2>&1 &
+    say "Voicemod starting (wine log: $WINELOG)"
+
+    # health check: UI rendered and driver check patched
+    for _ in $(seq 1 30); do
+        sleep 3
+        [ "$(grep -c "Voicemod app started" "$(vmlog)" 2>/dev/null)" -gt "$before" ] || continue
+        session=$(last_session)
+        if grep -q "Failed to share D3D11 texture" <<<"$session"; then
+            say "the UI cannot render (D3D11 texture sharing): is DXVK installed and Vulkan working?"
+            break
+        fi
+        if grep -q "\[WebView\] Rendering info" <<<"$session" && grep -q "^vercheck ok" "$HOOKLOG" 2>/dev/null; then
+            ok=1
+            break
+        fi
+    done
+
+    now=$(installed_version)
+    if [ $ok = 1 ]; then
+        echo "$now" >"$STATE/last_good"
+        [ -n "$now" ] && [ -z "$(ls -A "$BACKUPS")" ] && cp -a "$app" "$BACKUPS/$now"   # first backup
+        [ $approved = 1 ] && notify "Voicemod" "Started. If it updated itself, the next start checks the new version."
+        return 0
+    fi
+    good=$(cat "$STATE/last_good" 2>/dev/null)
+    if [ -n "$good" ] && [ "$good" != "$now" ] && [ -d "$BACKUPS/$good" ] &&
+       ask "Voicemod is not working" "Voicemod $now did not start correctly under Linux.
+Restore $good, which was working?" "Restore" "Leave it"; then
+        cmd_rollback && exec "$0" run
+    fi
+    notify "Voicemod" "Start not verified: see $(vmlog) and $HOOKLOG"
+    return 1
+}
+
+cmd_rollback() {
+    local b app
+    app=$(appdata)/app/last
+    b=$(ls -1t "$BACKUPS" 2>/dev/null | head -1)
+    [ -n "$b" ] || die "no backup to restore"
+    wineserver -k 2>/dev/null
+    rsync -a --delete "$BACKUPS/$b/" "$app/" || die "restore failed"
+    echo "$b" >"$STATE/last_good"
+    echo "$b" >"$STATE/skipped"          # do not offer the same update again right away
+    notify "Voicemod" "Restored version $b."
+}
+
+cmd_status() {
+    echo "prefix:     $WINEPREFIX"
+    echo "installed:  $(installed_version || true)"
+    echo "last good:  $(cat "$STATE/last_good" 2>/dev/null)"
+    echo "offered:    $(latest_version "$(installed_version)")"
+    echo "backups:    $(ls "$BACKUPS" 2>/dev/null | tr '\n' ' ')"
+    echo "running:    $(pgrep -f 'app.last.Voicemod.exe' >/dev/null && echo yes || echo no)"
+    echo "hook log:"; sed 's/^/  /' "$HOOKLOG" 2>/dev/null
+}
+
+cmd_uninstall() {
+    [ "${1:-}" = --yes ] || ask "Uninstall vmwine" "Remove $WINEPREFIX (Voicemod, its settings and backups)?" "Remove" "Cancel" || exit 0
+    wineserver -k 2>/dev/null
+    rm -rf "$WINEPREFIX"
+    rm -f "${XDG_DATA_HOME:-$HOME/.local/share}/applications/vmwine.desktop"
+    remove_audio_devices
+    say "removed."
+}
+
+# ---------------------------------------------------------------------------
+# Engine + Electron UI
+
+# Voicemod's interface is a web app compiled into Voicemod.exe as a Qt resource. Pull it
+# out of the user's own copy (nothing of Voicemod's is shipped here); redo it when the
+# installed version changes, since the frontend has to match the engine.
+extract_frontend() {
+    local exe ver tmp d
+    exe=$(appdata)/app/last/Voicemod.exe
+    [ -f "$exe" ] || return 1
+    ver=$(installed_version)
+    [ -n "$ver" ] || ver=unknown
+    if [ -f "$DATA/frontend/index.html" ] && [ "$(cat "$DATA/.voicemod-version" 2>/dev/null)" = "$ver" ]; then
+        return 0
+    fi
+    say "extracting Voicemod's interface from your copy of Voicemod.exe"
+    tmp=$(mktemp -d)
+    if ! python3 -I "$HERE/scripts/extract_qrc.py" "$exe" "$tmp" >/dev/null; then
+        rm -rf "$tmp"; return 1
+    fi
+    mkdir -p "$DATA"
+    for d in "$tmp"/*; do
+        if [ -f "$d/index.html" ]; then
+            rm -rf "$DATA/frontend"
+            cp -r "$d" "$DATA/frontend"
+            break
+        fi
+    done
+    rm -rf "$tmp"
+    [ -f "$DATA/frontend/index.html" ] || return 1
+    echo "$ver" >"$DATA/.voicemod-version"
+}
+
+# PIDs of Voicemod.exe running in THIS prefix (other prefixes' engines are not ours).
+engine_pids() {
+    local pid pfx
+    for pid in $(pgrep -f '[a]pp.last.Voicemod.exe'); do
+        pfx=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | sed -n 's/^WINEPREFIX=//p')
+        [ "$pfx" = "$WINEPREFIX" ] && echo "$pid"
+    done
+}
+
+wine_env() {
+    # same blocks as 'run': never let Voicemod self-update behind our back
+    export VMWINE_BLOCK_HOSTS=${VMWINE_BLOCK_HOSTS-$BLOCK_DEFAULT}
+    export QTWEBENGINE_DISABLE_SANDBOX=1 QT_QUICK_BACKEND=software QT_OPENGL=software
+}
+
+# Registry settings Voicemod needs under Wine (tools/vmwine.reg): re-applied whenever the file
+# changes, so an updated vmwine fixes existing installs too.
+apply_registry() {
+    local reg=$HERE/tools/vmwine.reg sum
+    [ -f "$reg" ] || return 0
+    sum=$(sha256sum "$reg" | cut -d' ' -f1)
+    [ "$(cat "$STATE/reg.sha" 2>/dev/null)" = "$sum" ] && return 0
+    mkdir -p "$STATE"
+    wine regedit /S "$(winepath -w "$reg")" >/dev/null 2>&1 && echo "$sum" >"$STATE/reg.sha"
+}
+
+cmd_start_engine() {
+    need wine wineserver pactl pw-link
+    [ -n "$(appdata)" ] || die "Voicemod is not installed: run 'vmwine install <installer>'"
+    mkdir -p "$BACKUPS"
+    sync_helpers
+    apply_registry
+    audio_devices
+    if [ -n "$(engine_pids)" ]; then say "engine already running"; return 0; fi
+    wine_env
+    export VMWINE_HIDE_QT=1
+    rm -f "$HOOKLOG"
+    wineserver -k 2>/dev/null
+    sleep 1
+    wineserver -p >/dev/null 2>&1 </dev/null
+    wine sc start voicemodvad >/dev/null 2>&1
+    wine 'C:\windows\system32\vmlaunch.exe' >"$WINELOG" 2>&1 &
+    disown
+    start_audio_guard
+    start_hotkeys
+    say "engine starting (wine log: $WINELOG)"
+}
+
+# Keeps stray links out of the virtual mic (see tools/vmaudio.py).
+start_audio_guard() {
+    mkdir -p "$STATE"
+    if [ -f "$STATE/audio.pid" ] && kill -0 "$(cat "$STATE/audio.pid")" 2>/dev/null; then return 0; fi
+    nohup python3 -I "$HERE/tools/vmaudio.py" watch >"$STATE/audio.log" 2>&1 &
+    echo $! >"$STATE/audio.pid"
+    disown
+}
+
+# Global hotkeys (tools/vmkeys.py) only run when the user has written bindings.
+hotkeys_conf() { echo "${VMWINE_HOTKEYS:-${XDG_CONFIG_HOME:-$HOME/.config}/vmwine/hotkeys.conf}"; }
+
+start_hotkeys() {
+    local conf; conf=$(hotkeys_conf)
+    # run when there is a config of our own, or unless mirroring has been switched off
+    [ -f "$conf" ] || [ ! -f "$(dirname "$conf")/no-sync" ] || return 0
+    mkdir -p "$STATE"
+    if [ -f "$STATE/keys.pid" ] && kill -0 "$(cat "$STATE/keys.pid")" 2>/dev/null; then return 0; fi
+    nohup python3 -I "$HERE/tools/vmkeys.py" run --conf "$conf" >"$STATE/keys.log" 2>&1 &
+    echo $! >"$STATE/keys.pid"
+    disown
+}
+
+stop_hotkeys() {
+    [ -f "$STATE/keys.pid" ] && kill "$(cat "$STATE/keys.pid")" 2>/dev/null
+    rm -f "$STATE/keys.pid"
+}
+
+stop_audio_guard() {
+    [ -f "$STATE/audio.pid" ] && kill "$(cat "$STATE/audio.pid")" 2>/dev/null
+    rm -f "$STATE/audio.pid"
+}
+
+cmd_stop() {
+    stop_hotkeys
+    stop_audio_guard
+    wineserver -k 2>/dev/null
+    sleep 1
+    remove_audio_devices
+    say "stopped"
+}
+
+cmd_url() {
+    [ -n "${1:-}" ] || die "usage: vmwine url voicemod://..."
+    wine_env
+    wine 'C:\windows\system32\vmlaunch.exe' "$1" >>"$WINELOG" 2>&1
+}
+
+cmd_ui() {
+    local el
+    [ -n "$(appdata)" ] || die "Voicemod is not installed: run 'vmwine install <installer>'"
+    el=$(command -v electron || true)
+    [ -n "$el" ] || el=$HERE/cache/electron/node_modules/.bin/electron
+    [ -x "$el" ] || die "electron not found (Arch: pacman -S electron)"
+    extract_frontend || die "could not extract the Voicemod interface"
+    export VMWINE_DATA=$DATA
+    exec "$el" --ozone-platform-hint=auto "$HERE/ui" "$@"
+}
+
+# Friendly front end for tools/vmkeys.py. Everything that changes the config also makes sure
+# the listener is running; the listener itself reloads the file within a few seconds.
+cmd_hotkeys() {
+    local sub=${1:-help} conf; conf=$(hotkeys_conf)
+    shift 2>/dev/null
+    case $sub in
+        add)    python3 -I "$HERE/tools/vmkeys.py" add --conf "$conf" "$@" && start_hotkeys &&
+                say "ready: the key works within a few seconds (Voicemod must be running)" ;;
+        remove) python3 -I "$HERE/tools/vmkeys.py" remove --conf "$conf" "$@" ;;
+        list|check) python3 -I "$HERE/tools/vmkeys.py" check --conf "$conf" ;;
+        sync)   case ${1:-status} in
+                    on)  rm -f "$(dirname "$conf")/no-sync"; start_hotkeys; say "mirroring the binds you make in Voicemod: on" ;;
+                    off) mkdir -p "$(dirname "$conf")"; : >"$(dirname "$conf")/no-sync"; say "mirroring the binds you make in Voicemod: off" ;;
+                    *)   [ -f "$(dirname "$conf")/no-sync" ] && say "mirroring: off" || say "mirroring: on" ;;
+                esac ;;
+        init)   python3 -I "$HERE/tools/vmkeys.py" init --conf "$conf" && start_hotkeys ;;
+        edit)   python3 -I "$HERE/tools/vmkeys.py" init --conf "$conf" >/dev/null
+                start_hotkeys
+                xdg-open "$conf" 2>/dev/null || "${VISUAL:-${EDITOR:-nano}}" "$conf" ;;
+        *)      cat <<HELP
+Global hotkeys for Voicemod
+  vmwine hotkeys add F9 "voice-changer toggle"   bind a key (replaces an existing bind)
+  vmwine hotkeys add KP1 "voice Banana"          switch to a voice
+  vmwine hotkeys add alt+K "sound Airhorn"       play a sound (use a modifier for letters)
+  vmwine hotkeys list                             show your binds and the ones mirrored from Voicemod
+  vmwine hotkeys sync on|off                      mirror (or stop mirroring) binds made inside Voicemod
+  vmwine hotkeys remove F9                        delete a bind
+  vmwine hotkeys edit                             open the file in your editor
+Commands: voice NAME|random|list, sound NAME|stop|list, voice-changer on|off|toggle,
+          hear-myself on|off|toggle, mute on|off|toggle
+Find names with:  vmwine ctl voice list    or    vmwine ctl sound list
+HELP
+                ;;
+    esac
+}
+
+case "${1:-ui}" in
+    install)   shift; cmd_install "$@" ;;
+    ui)        shift; cmd_ui "$@" ;;
+    start-engine) cmd_start_engine ;;
+    stop)      cmd_stop ;;
+    url)       shift; cmd_url "$@" ;;
+    ctl)       shift; exec python3 -I "$HERE/tools/voicemod-ctl" "$@" ;;
+    hotkeys)   shift; cmd_hotkeys "$@" ;;
+    menu)      desktop_entry; say "menu entry and voicemod:// handler installed" ;;
+    run)       cmd_run ;;
+    rollback)  cmd_rollback ;;
+    status)    cmd_status ;;
+    uninstall) shift; cmd_uninstall "$@" ;;
+    -h|--help|help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command '$1' (see vmwine --help)" ;;
+esac

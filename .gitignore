@@ -1,0 +1,12 @@
+build/
+build.log
+cache/
+data/
+data-fresh/
+dev-logs/
+installer/
+*.log
+prefix/
+prefix-fresh/
+__pycache__/
+research/

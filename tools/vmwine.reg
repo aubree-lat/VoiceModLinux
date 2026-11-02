@@ -1,0 +1,12 @@
+REGEDIT4
+
+; Applied to the Wine prefix by `vmwine` (install and every start; see apply_registry).
+
+; 1. Hide Wine's fallback system-tray window, a small separate window that shows Voicemod's
+;    tray icon. The tray menu is not needed: the Linux window replaces it.
+;    (Setting from AriCuteGirl/voicemod-linux, MIT.)
+[HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer]
+"NoTrayItemsDisplay"=dword:00000001
+
+[HKEY_CURRENT_USER\Software\Wine\Explorer]
+"ShowSystray"=dword:00000000
